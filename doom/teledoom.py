@@ -31,7 +31,9 @@ if not TWITCH_URL:
 
 class Overlay:
     def __init__(self):
-        self.font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 16)
+        self.font16 = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 16)
+        self.font12 = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 12)
+        self.overlay_image = Image.open('overlay.png')
         self.set_caller(None)
 
     def set_caller(self, phone_number):
@@ -45,7 +47,8 @@ class Overlay:
     def format_phone_number(phone_number):
         try:
             # Parse and format the number
-            phone_number = phonenumbers.parse(phone_number, None)
+            # TODO: Find a better way to parse E164 numbers
+            phone_number = phonenumbers.parse('+' + phone_number, None)
             phone_number = phonenumbers.format_number(phone_number, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
 
             # Obfuscate by finding the middle 4 digits and replacing them with Xs
@@ -62,13 +65,18 @@ class Overlay:
             phone_number = "Unknown caller"
         return phone_number
 
-    def draw(self, frame):
+    def draw(self, frame, button_manager):
         frame = Image.fromarray(frame)
         draw = ImageDraw.Draw(frame)
-        width = draw.textsize(self.caller, self.font)[0]
-        draw.polygon([(320-width-12, 0), (320, 0), (320, 20), (320-width-2, 20)], fill=(128, 0, 0, 255), outline=(0, 0, 0, 255))
-        draw.text((320-width-1,1), self.caller, font=self.font, fill=(255,255,255,255))
+        width = draw.textsize(self.caller, self.font16)[0]
+        draw.polygon([(320-width-12, 0), (320, 0), (320, 20), (320-width-2, 20)], fill=(112, 0, 0, 255), outline=(0, 0, 0, 255))
+        draw.text((320-width-1,1), self.caller, font=self.font16, fill=(255,255,255,255))
+        for i, pressed in enumerate(button_manager.get_action()):
+            x = 320-60 + (i % 3) * 20
+            y = 20 + (i // 3) * 20
+            draw.rectangle([(x, y), (x+20, y+20)], fill=(192, 192, 0, 255) if pressed else (112, 0,0, 255), outline=(0, 0, 0, 255), width=1)
         del draw
+        frame.paste(self.overlay_image, (320-60, 20), self.overlay_image)
         frame = np.array(frame)
         return frame
 
@@ -140,7 +148,7 @@ class Simwood:
         async with aiohttp.ClientSession(auth=self.auth) as session:
             url = Simwood.BASE_URL + 'messaging/' + self.account + '/sms'
             try:
-                to = phonenumbers.parse(to, None)
+                to = phonenumbers.parse('+' + to, None)
                 to = phonenumbers.format_number(to, phonenumbers.PhoneNumberFormat.E164)
                 data = {'from': self.number,
                         'to': to,
@@ -173,40 +181,42 @@ class Asterisk:
         await channel.answer()
         if simwood:
             await simwood.send_sms(caller, "Welcome to TeleDoom!  Please go to https://twitch.tv/teledoom to view the action.")
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1)
         await channel.play(media='sound:welcome-to-teledoom')
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(3.15)
         await channel.play(media='sound:please-go-to-twitch')
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(6.2)
         if not self.playing:
-            self.playing = (caller, channel.id)
+            self.playing = (caller, channel)
             await channel.play(media='sound:you-are-entering-the-game')
+            await asyncio.sleep(1.3)
             await self.doom_queue.put((Event.NEW_PLAYER, self.playing[0]))
         else:
-            self.waiting.append((caller, channel.id))
+            self.waiting.append((caller, channel))
             await channel.play(media='sound:you-are-being-placed-in-a-queue')
 
     async def on_dtmf(self, channel, event):
-        if self.playing and channel.id == self.playing[1]:
+        if self.playing and channel.id == self.playing[1].id:
             await self.doom_queue.put((Event.BUTTON_PRESSED, event['digit']))
 
     async def on_end(self, channel, event):
-        if channel.id == self.playing[1]:
+        if channel.id == self.playing[1].id:
             if len(self.waiting) > 0:
                 self.playing = self.waiting[0]
                 self.waiting = self.waiting[1:]
-                await channel.play(media='sound:you-are-entering-the-game')
+                await self.playing[1].play(media='sound:you-are-entering-the-game')
+                await asyncio.sleep(1.3)
                 await self.doom_queue.put((Event.NEW_PLAYER, self.playing[0]))
             else:
                 self.playing = None
                 await self.doom_queue.put((Event.NO_PLAYER, None))
         else:
-            self.waiting = [x for x in self.waiting if channel.id != x[1]]
+            self.waiting = [x for x in self.waiting if channel.id != x[1].id]
 
 class ButtonManager:
     BUTTON_MAP = {
-        '1': vzd.Button.MOVE_LEFT,          '2': vzd.Button.MOVE_FORWARD,  '3': vzd.Button.MOVE_RIGHT,
-        '4': vzd.Button.TURN_LEFT,          '5': vzd.Button.ATTACK,        '6': vzd.Button.TURN_RIGHT,
+        '1': vzd.Button.TURN_LEFT,          '2': vzd.Button.MOVE_FORWARD,  '3': vzd.Button.TURN_RIGHT,
+        '4': vzd.Button.MOVE_LEFT,          '5': vzd.Button.ATTACK,        '6': vzd.Button.MOVE_RIGHT,
         '7': vzd.Button.CROUCH,             '8': vzd.Button.MOVE_BACKWARD, '9': vzd.Button.JUMP,
         '*': vzd.Button.SELECT_PREV_WEAPON, '0': vzd.Button.USE,           '#': vzd.Button.SELECT_NEXT_WEAPON,
     }
@@ -222,8 +232,10 @@ class ButtonManager:
         else:
             log.warning("Button '" + button + "' not found in BUTTON_MAP - ignoring")
 
-    def get_action(self):
+    def advance(self):
         self.button_timeout = [max(x - 1, 0) for x in self.button_timeout]
+
+    def get_action(self):
         return [x > 0 for x in self.button_timeout]
 
 class Doom:
@@ -260,13 +272,13 @@ class Doom:
                 event = await self.asterisk_queue.get()
                 log.info(event)
                 if event[0] == Event.GOT_CONNECTION:
-                    idle_frames_left = DOOM_FPS * 15
+                    idle_frames_left = DOOM_FPS * 20
                 elif event[0] == Event.NEW_PLAYER:
                     self.overlay.set_caller(event[1])
                     idle = False
                 elif event[0] == Event.NO_PLAYER:
                     self.overlay.set_caller(None)
-                    idle_frames_left = DOOM_FPS * 15
+                    idle_frames_left = DOOM_FPS * 20
 
                 with self.twitch as stream:
                     start = self.loop.time()
@@ -280,7 +292,7 @@ class Doom:
                         state = self.game.get_state()
                         frame = state.screen_buffer
 
-                        frame = self.overlay.draw(frame)
+                        frame = self.overlay.draw(frame, button_manager)
 
                         stream.send_frame(frame)
 
@@ -293,7 +305,7 @@ class Doom:
                                 log.info(event)
                                 if event[0] == Event.GOT_CONNECTION:
                                     if idle:
-                                        idle_frames_left = DOOM_FPS * 15
+                                        idle_frames_left = DOOM_FPS * 20
                                 elif event[0] == Event.NEW_PLAYER:
                                     self.overlay.set_caller(event[1])
                                     self.game.new_episode()
@@ -304,11 +316,12 @@ class Doom:
                                     self.game.new_episode()
                                     button_manager = ButtonManager()
                                     idle = True
-                                    idle_frames_left = DOOM_FPS * 15
+                                    idle_frames_left = DOOM_FPS * 20
                                 elif event[0] == Event.BUTTON_PRESSED:
                                     button_manager.button_pressed(event[1], DOOM_FPS // 2)
                         except asyncio.exceptions.TimeoutError:
                             pass
+                        button_manager.advance()
                         self.game.make_action(button_manager.get_action())
         except:
             log.exception("Caught exception - stopping")
